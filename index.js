@@ -61,8 +61,15 @@ app.get('/', (req, res) => {
             <h1>Ernie Proxy Gateway</h1>
             <div class="badge">VNC-Free Clicker Online</div>
         </header>
+        
+        <div class="tabs" style="display: flex; gap: 1rem; margin-bottom: 2rem; border-bottom: 1px solid var(--border);">
+            <button class="tab-btn active" onclick="switchTab('harvester')" style="background: none; border: none; color: white; padding: 10px; border-bottom: 2px solid var(--primary); cursor: pointer; border-radius: 0;">Harvester</button>
+            <button class="tab-btn" onclick="switchTab('accounts')" style="background: none; border: none; color: var(--text-muted); padding: 10px; cursor: pointer; border-radius: 0;">Accounts DB</button>
+            <button class="tab-btn" onclick="switchTab('models')" style="background: none; border: none; color: var(--text-muted); padding: 10px; cursor: pointer; border-radius: 0;">Models</button>
+        </div>
 
-        <p style="color: var(--text-muted);">Fully Stateless Ernie Setup. Combine models with suffixes: <code>EB50-Search-Thinking</code></p>
+        <div id="tab-harvester" class="tab-content" style="display: block;">
+        <p style="color: var(--text-muted);">Fully Stateless Ernie Setup. Use Admin Password to authenticate actions.</p>
         
         <h3>API Endpoint</h3>
         <div class="endpoint-box">POST /v1/chat/completions</div>
@@ -74,22 +81,95 @@ app.get('/', (req, res) => {
             <button onclick="launchBrowser()">Launch Screenshot Harvester</button>
         </div>
 
-        <div id="statusText">Status: Idle</div>
-
-        <div class="browser-container" id="bcontainer">
-            <img id="sshot" draggable="false" onclick="handleImgClick(event)" />
         </div>
 
-        <div class="browser-controls" style="margin-top:20px; display:none;" id="typeOps">
-            <input type="text" id="typeInput" placeholder="Text to type...">
-            <button onclick="sendType()">Type Text</button>
-            <button onclick="fastRefresh()" style="background:#10b981;">Force Manual Refresh</button>
+        <div id="tab-accounts" class="tab-content" style="display: none;">
+            <h3>Saved Accounts</h3>
+            <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 1rem;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 0.9rem;">
+                    <thead style="background: rgba(255,255,255,0.05); text-align: left;">
+                        <tr><th style="padding: 12px; border-bottom: 1px solid var(--border);">Email/Name</th><th style="padding: 12px; border-bottom: 1px solid var(--border);">Status</th><th style="padding: 12px; border-bottom: 1px solid var(--border);">Requests</th><th style="padding: 12px; border-bottom: 1px solid var(--border);">Last Used</th><th style="padding: 12px; border-bottom: 1px solid var(--border);">Action</th></tr>
+                    </thead>
+                    <tbody id="accountsTableBody">
+                    </tbody>
+                </table>
+            </div>
+            <button onclick="fetchAccounts()" style="background: var(--surface); border: 1px solid var(--border); width: auto;">↻ Refresh Accounts</button>
         </div>
+
+        <div id="tab-models" class="tab-content" style="display: none;">
+            <h3>Available Ernie Models</h3>
+            <div class="endpoint-box">POST /v1/chat/completions</div>
+            <p style="color: var(--text-muted); margin-bottom: 1rem; font-size: 0.9rem;">Combine the following model prefixes and suffixes to craft your request endpoint model name:</p>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                <div style="background: rgba(255,255,255,0.05); padding: 1rem; border-radius: 8px; border: 1px solid var(--border);">
+                    <h4 style="margin-top: 0;">Base Models</h4>
+                    <p><code>EB50</code> - Base Model<br><code>EB51</code> - Version 5.1<br><code>EB-Cobuddy</code> - Cobuddy</p>
+                </div>
+                <div style="background: rgba(255,255,255,0.05); padding: 1rem; border-radius: 8px; border: 1px solid var(--border);">
+                    <h4 style="margin-top: 0;">Feature Suffixes</h4>
+                    <p><code>-Thinking</code> (or <code>-Think</code>)<br><code>-Search</code><br><code>-Slow</code></p>
+                </div>
+            </div>
+            <p style="margin-top: 1rem;"><strong>Example:</strong> <code>EB50-Search-Thinking</code></p>
+        </div>
+
     </div>
 
     <script>
         let browserInterval = null;
         let pToken = '';
+
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+                btn.style.borderBottom = 'none';
+                btn.style.color = 'var(--text-muted)';
+            });
+            document.getElementById('tab-' + tabId).style.display = 'block';
+            event.target.style.borderBottom = '2px solid var(--primary)';
+            event.target.style.color = 'white';
+
+            if (tabId === 'accounts') fetchAccounts();
+        }
+
+        async function fetchAccounts() {
+            if (!pToken) pToken = document.getElementById('adminPwd').value;
+            try {
+                const res = await fetch('/admin/accounts', {
+                    headers: { 'Authorization': 'Bearer ' + pToken }
+                });
+                const accs = await res.json();
+                if (res.ok) {
+                    const tbody = document.getElementById('accountsTableBody');
+                    if (accs.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" style="padding: 12px; text-align: center; color: var(--text-muted);">No accounts saved.</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = accs.map(a => 
+                        '<tr>' +
+                        '<td style="padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.05);">' + a.name + '</td>' +
+                        '<td style="padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.05); color: ' + (a.active ? '#34d399' : '#f87171') + '">' + (a.active ? 'Active' : 'Disabled') + '</td>' +
+                        '<td style="padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.05);">' + a.request_count + '</td>' +
+                        '<td style="padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.05); color: var(--text-muted); font-size: 0.8rem;">' + (a.last_used || 'Never') + '</td>' +
+                        '<td style="padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.05);"><button style="padding: 4px 8px; font-size: 0.75rem; width: auto; background: ' + (a.active ? '#f87171' : '#34d399') + '" onclick="toggleAccount(' + a.id + ', ' + (!a.active) + ')">' + (a.active ? 'Disable' : 'Enable') + '</button></td>' +
+                        '</tr>'
+                    ).join('');
+                }
+            } catch (e) {
+                toast("Could not fetch accounts. Wrong password?", "red");
+            }
+        }
+
+        async function toggleAccount(id, state) {
+            await fetch('/admin/accounts/' + id, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + pToken },
+                body: JSON.stringify({ active: state })
+            });
+            fetchAccounts();
+        }
 
         async function toast(msg, color) {
             document.getElementById('statusText').innerText = msg;
@@ -234,6 +314,26 @@ app.post('/admin/browser/type', adminAuth, async (req, res) => {
 
 app.get('/admin/browser/status', adminAuth, async (req, res) => {
     res.json(getBrowserStatus());
+});
+
+// Database Fetching / Toggling
+app.get('/admin/accounts', adminAuth, (req, res) => {
+    try {
+        const accs = db.prepare('SELECT id, name, active, request_count, last_used FROM accounts ORDER BY id DESC').all();
+        res.json(accs);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.patch('/admin/accounts/:id', adminAuth, (req, res) => {
+    try {
+        const { active } = req.body;
+        db.prepare('UPDATE accounts SET active = ? WHERE id = ?').run(active ? 1 : 0, req.params.id);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // Manual cURL fallback — paste a cURL from browser DevTools
