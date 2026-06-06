@@ -8,7 +8,7 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Clone your updated repository
-RUN git clone https://github.com/Sexlovr/ernie-2-api-noauth-.git .
+RUN git clone https://github.com/Sexlovr/ernie-noauth-v2.git .
 
 # Install dependencies
 RUN npm install --omit=dev
