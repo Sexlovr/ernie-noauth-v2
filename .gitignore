@@ -1,8 +1,10 @@
 node_modules/
 data/
 .env
+proxies.txt
 *.db
 *.db-shm
 *.db-wal
+recon*.cjs
 recon*.js
 test*.js

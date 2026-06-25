@@ -1,16 +1,14 @@
 {
-  "name": "ernie-proxy",
-  "version": "1.0.0",
+  "name": "ernie-noauth-proxy",
+  "version": "3.0.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^12.10.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "playwright": "^1.40.0",
-    "uuid": "^14.0.0"
+    "undici": "^8.5.0"
   }
 }

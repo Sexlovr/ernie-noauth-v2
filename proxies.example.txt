@@ -1,0 +1,11 @@
+# One egress proxy per line. Lines starting with # are ignored.
+# Supported formats:
+#   http://user:pass@host:port
+#   socks5://user:pass@host:port
+#   host:port:user:pass         (Webshare dashboard "IP:PORT:USER:PASS" export)
+#   host:port                   (no auth)
+#
+# Each line = one independent per-IP rate budget. Capacity scales with line count.
+# Webshare free gives 10; paste them here (rename this file to proxies.txt).
+# Example (Webshare-style):
+# 31.59.20.176:6754:lqkxxsas:1r3re6px5atq

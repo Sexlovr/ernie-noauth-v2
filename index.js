@@ -1,214 +1,131 @@
+// ernie-noauth proxy — OpenAI-compatible front over chat.baidu.com guest chat.
+// Browser-free. Capacity scales with egress IPs (proxies + direct), each an
+// independent per-IP rate budget managed by the pool.
 import express from 'express';
-import dotenv from 'dotenv';
-import { v4 as uuidv4 } from 'uuid';
-import { db, getNextAccount, bumpAccountUsage, disableAccount } from './lib/database.js';
-import { fetchErnieSSE } from './lib/ernieClient.js';
-import { resolveModelParams, buildFullContext, buildOpenAIChunk } from './lib/translator.js';
-import { getScreenshot, clickAt, typeText, launchInteractiveBrowser, getBrowserStatus } from './lib/browser_controller.js';
-import { parseErnieCurl } from './lib/curlParser.js';
-import { buildAdminPage } from './lib/page.js';
+import { config, buildEgress } from './lib/config.js';
+import { Pool } from './lib/pool.js';
+import { streamConversation } from './lib/baiduClient.js';
+import { resolveModel, messagesToQuery, MODELS, newId, streamChunk, fullResponse } from './lib/translator.js';
 
-dotenv.config();
+const egress = buildEgress();
+const pool = new Pool(egress);
+pool.startWarmer();
+console.log(`[pool] ${pool.size()} egress slot(s): ${egress.map((e) => e.label).join(', ')}`);
 
 const app = express();
-const port = process.env.PORT || 7860;
+app.use(express.json({ limit: '16mb' }));
 
-app.use(express.json({ limit: '10mb' }));
+// ── auth ──
+function authed(req, res) {
+  if (!config.apiKey) return true;
+  const got = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (got === config.apiKey) return true;
+  res.status(401).json({ error: { message: 'invalid api key', type: 'invalid_request_error' } });
+  return false;
+}
 
-const adminAuth = (req, res, next) => {
-    const expected = process.env.ADMIN_PASSWORD || 'admin';
-    const provided = req.headers.authorization?.replace('Bearer ', '') || req.query.token;
-    if (provided !== expected) return res.status(401).send("Unauthorized");
-    next();
-};
-
-app.get('/', (req, res) => {
-    res.send(buildAdminPage());
-});
-
-app.post('/admin/login', (req, res) => {
-    const { password } = req.body;
-    const expected = process.env.ADMIN_PASSWORD || 'admin';
-    if (password === expected) return res.json({ success: true, token: expected });
-    return res.status(401).json({ error: 'Incorrect Password' });
-});
-
-app.post('/admin/browser/launch', adminAuth, async (req, res) => {
+// Drive one completion across the pool. Retries on another IP whenever a slot is
+// walled (kunlun) or errors BEFORE any answer text has been emitted. onDelta is
+// only ever called with real answer text, so once it fires we are committed.
+async function generate({ query, model, signal, onDelta, onReason }) {
+  const tried = new Set();
+  let lastErr = 'no egress available';
+  for (let attempt = 0; attempt < config.maxRetries; attempt++) {
+    const slot = await pool.acquire({ exclude: tried });
+    if (!slot) break;
+    tried.add(slot.id);
+    let got = false;
+    let outcome = 'error';
     try {
-        const { email } = req.body;
-        if (!email) return res.status(400).json({ error: 'Email/Name required' });
-        const result = await launchInteractiveBrowser(email, db);
-        res.json(result);
+      for await (const ev of streamConversation({ session: slot.cookie, query, model, dispatcher: slot.dispatcher, signal })) {
+        if (ev.kind === 'delta') { got = true; outcome = 'ok'; onDelta(ev.text); }
+        else if (ev.kind === 'reason') { onReason?.(ev.text); }
+        else if (ev.kind === 'depleted') { outcome = 'depleted'; lastErr = 'all egress IPs rate-limited (kunlun)'; break; }
+        else if (ev.kind === 'error') { outcome = 'error'; lastErr = ev.message; break; }
+        else if (ev.kind === 'done') { outcome = got ? 'ok' : 'error'; if (!got) lastErr = 'empty response'; }
+      }
     } catch (e) {
-        res.status(500).json({ error: e.message });
+      if (signal?.aborted) { pool.release(slot, got ? 'ok' : 'error'); return { ok: false, aborted: true }; }
+      outcome = 'error'; lastErr = e?.message || String(e);
     }
-});
-
-app.get('/admin/browser/screenshot', adminAuth, async (req, res) => {
-    try {
-        const buf = await getScreenshot();
-        if (!buf) return res.status(404).json({ error: 'No screenshot available yet' });
-        res.setHeader('Content-Type', 'image/jpeg');
-        res.send(buf);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.post('/admin/browser/click', adminAuth, async (req, res) => {
-    try {
-        const { x, y } = req.body;
-        await clickAt(x, y);
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.post('/admin/browser/type', adminAuth, async (req, res) => {
-    try {
-        const { text } = req.body;
-        await typeText(text);
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.get('/admin/browser/status', adminAuth, async (req, res) => {
-    res.json(getBrowserStatus());
-});
-
-// Database Fetching / Toggling
-app.get('/admin/accounts', adminAuth, (req, res) => {
-    try {
-        const accs = db.prepare('SELECT id, name, active, request_count, last_used FROM accounts ORDER BY id DESC').all();
-        res.json(accs);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.patch('/admin/accounts/:id', adminAuth, (req, res) => {
-    try {
-        const { active } = req.body;
-        db.prepare('UPDATE accounts SET active = ? WHERE id = ?').run(active ? 1 : 0, req.params.id);
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.delete('/admin/accounts/:id', adminAuth, (req, res) => {
-    try {
-        db.prepare('DELETE FROM accounts WHERE id = ?').run(req.params.id);
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Manual cURL fallback — paste a cURL from browser DevTools
-app.post('/admin/accounts', (req, res) => {
-    try {
-        const { curlString } = req.body;
-        if (!curlString) return res.status(400).json({ error: 'curlString required in body' });
-        const parsed = parseErnieCurl(curlString);
-        db.prepare(`INSERT INTO accounts (name, acs_token, sign, jt, cookie_string) VALUES (?, ?, ?, ?, ?)`)
-          .run(parsed.name, parsed.acs_token, parsed.sign, parsed.jt, parsed.cookie_string);
-        res.json({ success: true, message: 'Account added via cURL paste' });
-    } catch (e) {
-        res.status(400).json({ error: e.message });
-    }
-});
+    pool.release(slot, got ? 'ok' : outcome);
+    if (got) return { ok: true };
+    if (signal?.aborted) return { ok: false, aborted: true };
+  }
+  return { ok: false, error: lastErr };
+}
 
 app.post('/v1/chat/completions', async (req, res) => {
-    try {
-        let account = getNextAccount();
-        if (!account) {
-            return res.status(500).json({ error: { message: "No active accounts available. Automated Harvester has not grabbed one yet. Please interact with the / endpoint clicker UI." } });
-        }
+  if (!authed(req, res)) return;
+  const { messages, model = 'ernie-noauth', stream = false } = req.body || {};
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: { message: 'messages array is required', type: 'invalid_request_error' } });
+  }
 
-        const { messages, model, stream } = req.body;
-        if (!messages || !Array.isArray(messages)) {
-            return res.status(400).json({ error: 'messages array is required' });
-        }
+  const query = messagesToQuery(messages);
+  const resolved = resolveModel(model);
+  const id = newId();
 
-        // FULL STATELESS DUMP: Ignore ALL "session hash" or "message_count" checks.
-        // We literally just smash System, User, Assistant, into one prompt.
-        const modelParams = resolveModelParams(model);
-        const promptText = buildFullContext(messages);
-        
-        res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
+  const ac = new AbortController();
+  // abort only on real client disconnect (res 'close' before we finish) — NOT on
+  // req 'close', which fires as soon as the POST body is consumed.
+  let finished = false;
+  res.on('close', () => { if (!finished) ac.abort(); });
+  const timeout = setTimeout(() => ac.abort(), config.requestTimeoutMs);
 
-        const responseId = 'chatcmpl-' + uuidv4();
-        let fullResponse = '';
-
-        try {
-            // Passing the stateless parsed model params
-            const streamIterator = fetchErnieSSE(account, promptText, modelParams);
-            bumpAccountUsage(account.id);
-
-            for await (const event of streamIterator) {
-                if (event.data) {
-                    try {
-                        const parsed = JSON.parse(event.data);
-                        const payloadData = parsed.data || {};
-                        
-                        if (payloadData.content) {
-                            let text = payloadData.content; 
-                            text = text.replace(/\0/g, ''); // Remove null bytes
-
-                            if (stream) {
-                                res.write(buildOpenAIChunk(responseId, model, { content: text }));
-                            }
-                            fullResponse += text;
-                        }
-                    } catch (e) {
-                         // Some chunks (major event lines) might throw parsing errors gently ignore them
-                    }
-                }
-            }
-
-            if (stream) {
-                res.write('data: [DONE]\n\n');
-                res.end();
-            } else {
-                res.json({
-                    id: responseId,
-                    object: 'chat.completion',
-                    created: Math.floor(Date.now() / 1000),
-                    model: model,
-                    choices: [{
-                        index: 0,
-                        message: { role: 'assistant', content: fullResponse },
-                        finish_reason: 'stop'
-                    }]
-                });
-            }
-
-        } catch (apiError) {
-            console.error('Ernie API Error:', apiError);
-            if (apiError.message.includes('401') || apiError.message.includes('403') || apiError.message.includes('signature')) {
-                disableAccount(account.id);
-            }
-            if (stream) {
-                res.write(`data: ${JSON.stringify({ error: apiError.message })}\n\n`);
-                res.write('data: [DONE]\n\n');
-                res.end();
-            } else if (!res.headersSent) {
-                res.status(500).json({ error: apiError.message });
-            }
-        }
-
-    } catch (err) {
-        console.error('Proxy Error:', err);
-        if (!res.headersSent) res.status(500).json({ error: err.message });
+  try {
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+      let opened = false;
+      const r = await generate({
+        query, model: resolved, signal: ac.signal,
+        onDelta: (text) => {
+          if (!opened) { opened = true; res.write(streamChunk(id, model, { role: 'assistant', content: '' })); }
+          res.write(streamChunk(id, model, { content: text }));
+        },
+      });
+      if (r.aborted) return res.end();
+      if (!r.ok && !opened) {
+        res.write(streamChunk(id, model, { role: 'assistant', content: `[proxy error: ${r.error}]` }));
+      }
+      res.write(streamChunk(id, model, {}, 'stop'));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      let content = '';
+      const r = await generate({ query, model: resolved, signal: ac.signal, onDelta: (t) => { content += t; } });
+      if (r.aborted) return;
+      if (!r.ok) return res.status(502).json({ error: { message: r.error, type: 'upstream_error' } });
+      res.json(fullResponse(id, model, content));
     }
+  } finally {
+    finished = true;
+    clearTimeout(timeout);
+  }
 });
 
-app.listen(port, "0.0.0.0", () => {
-    console.log(`Ernie-Proxy server running on port ${port}`);
+app.get('/v1/models', (req, res) => {
+  res.json({ object: 'list', data: MODELS.map((m) => ({ id: m, object: 'model', created: 0, owned_by: 'baidu' })) });
 });
+
+app.get('/health', (req, res) => res.json({ ok: true, healthy: pool.healthy(), size: pool.size() }));
+
+app.get('/status', (req, res) => {
+  const snap = pool.snapshot();
+  if ((req.headers.accept || '').includes('application/json') || req.query.json !== undefined) return res.json(snap);
+  const rows = snap.slots.map((s) =>
+    `<tr><td>${s.label}</td><td>${s.cooling ? `cooling ${Math.ceil(s.cooldownInMs / 1000)}s` : 'ready'}</td>` +
+    `<td>${s.tokens}</td><td>${s.hasCookie ? '✓' : '—'}</td><td>${s.ok}</td><td>${s.depleted}</td><td>${s.errors}</td></tr>`
+  ).join('');
+  res.send(`<!doctype html><meta charset=utf8><title>ernie-noauth pool</title>
+<style>body{font:14px system-ui;margin:2rem;background:#0b0d10;color:#e6e6e6}table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #2a2f37;padding:6px 10px;text-align:left}th{background:#161b22}h1{font-size:18px}</style>
+<h1>ernie-noauth pool — ${snap.healthy}/${snap.size} healthy</h1>
+<table><tr><th>egress</th><th>state</th><th>tokens</th><th>cookie</th><th>ok</th><th>depleted</th><th>errors</th></tr>${rows}</table>
+<p style=color:#8b949e>auto-refreshing every 3s</p><script>setTimeout(()=>location.reload(),3000)</script>`);
+});
+
+app.listen(config.port, '0.0.0.0', () => console.log(`ernie-noauth proxy on :${config.port}`));
