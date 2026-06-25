@@ -5,7 +5,7 @@ import express from 'express';
 import { config, buildEgress } from './lib/config.js';
 import { Pool } from './lib/pool.js';
 import { streamConversation } from './lib/baiduClient.js';
-import { resolveModel, messagesToQuery, MODELS, newId, streamChunk, fullResponse } from './lib/translator.js';
+import { resolveModel, messagesToQuery, MODELS, newId, streamChunk, fullResponse, makeStreamFilter, stripFollowupTail } from './lib/translator.js';
 
 const egress = buildEgress();
 const pool = new Pool(egress);
@@ -80,14 +80,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders?.();
       let opened = false;
+      const filt = makeStreamFilter();
+      const emit = (text) => {
+        if (!text) return;
+        if (!opened) { opened = true; res.write(streamChunk(id, model, { role: 'assistant', content: '' })); }
+        res.write(streamChunk(id, model, { content: text }));
+      };
       const r = await generate({
         query, model: resolved, signal: ac.signal,
-        onDelta: (text) => {
-          if (!opened) { opened = true; res.write(streamChunk(id, model, { role: 'assistant', content: '' })); }
-          res.write(streamChunk(id, model, { content: text }));
-        },
+        onDelta: (text) => emit(filt.push(text)),
       });
       if (r.aborted) return res.end();
+      emit(filt.flush());
       if (!r.ok && !opened) {
         res.write(streamChunk(id, model, { role: 'assistant', content: `[proxy error: ${r.error}]` }));
       }
@@ -99,7 +103,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const r = await generate({ query, model: resolved, signal: ac.signal, onDelta: (t) => { content += t; } });
       if (r.aborted) return;
       if (!r.ok) return res.status(502).json({ error: { message: r.error, type: 'upstream_error' } });
-      res.json(fullResponse(id, model, content));
+      res.json(fullResponse(id, model, stripFollowupTail(content)));
     }
   } finally {
     finished = true;
