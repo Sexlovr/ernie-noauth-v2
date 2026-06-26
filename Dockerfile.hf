@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+#
+# Self-contained Hugging Face Space Dockerfile.
+# ---------------------------------------------------------------------------
+# This is the ONLY file your HF Space needs. On build it clones the proxy code
+# straight from GitHub and runs it — nothing else has to live in the Space.
+#
+# Deploy:
+#   1. Create a new Space → SDK: Docker → Blank.
+#   2. Add this file to the Space as `Dockerfile` (HF requires that exact name).
+#   3. (optional) Add a `PROXIES` secret: host:port:user:pass,host2:port2:...
+#   4. Build runs automatically.
+#
+# Update to latest GitHub commit: "Factory rebuild" the Space, or bump
+# CACHEBUST below (any new value re-clones).
+# ---------------------------------------------------------------------------
+FROM node:22-slim
+
+# git is needed for the clone; ca-certificates for HTTPS
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# node:* images already ship a non-root `node` user at UID 1000 — exactly the
+# UID Hugging Face Spaces run as. Reuse it (don't useradd; UID 1000 is taken).
+RUN mkdir -p /home/node/app && chown -R node:node /home/node
+USER node
+ENV HOME=/home/node
+WORKDIR /home/node/app
+
+# --- which code to deploy (override at build time with --build-arg) ---
+ARG REPO=https://github.com/Sexlovr/ernie-noauth-v2.git
+ARG BRANCH=noauth-v3-chatbaidu
+# change this value to force a fresh clone of the latest commit
+ARG CACHEBUST=1
+
+# Clone (shallow, single branch) + install prod deps. CACHEBUST is referenced
+# so editing it actually invalidates the Docker layer cache.
+RUN echo "build=$CACHEBUST" \
+    && git clone --depth 1 --branch "$BRANCH" "$REPO" . \
+    && npm install --omit=dev \
+    && npm cache clean --force
+
+# Hugging Face Spaces serve on 7860
+ENV PORT=7860 \
+    INCLUDE_DIRECT=true
+EXPOSE 7860
+
+CMD ["node", "index.js"]
