@@ -23,7 +23,8 @@ RUN apt-get update \
 
 # node:* images already ship a non-root `node` user at UID 1000 — exactly the
 # UID Hugging Face Spaces run as. Reuse it (don't useradd; UID 1000 is taken).
-RUN mkdir -p /home/node/app && chown -R node:node /home/node
+# /data is HF's persistent mount (created here too as a writable fallback).
+RUN mkdir -p /home/node/app /data && chown -R node:node /home/node /data
 USER node
 ENV HOME=/home/node
 WORKDIR /home/node/app
@@ -43,7 +44,8 @@ RUN echo "build=$CACHEBUST" \
 
 # Hugging Face Spaces serve on 7860
 ENV PORT=7860 \
-    INCLUDE_DIRECT=true
+    INCLUDE_DIRECT=true \
+    DATA_DIR=/data
 EXPOSE 7860
 
 CMD ["node", "index.js"]
