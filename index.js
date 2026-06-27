@@ -6,7 +6,7 @@ import { fetch as uFetch } from 'undici';
 import { config, egressFromLines, parseProxyText, envProxyText, envIncludeDirect } from './lib/config.js';
 import { Pool } from './lib/pool.js';
 import { streamConversation } from './lib/baiduClient.js';
-import { resolveModel, messagesToQuery, MODELS, newId, streamChunk, fullResponse, makeStreamFilter, stripFollowupTail } from './lib/translator.js';
+import { resolveModel, messagesToQuery, MODELS, newId, streamChunk, fullResponse, makeStreamFilter, stripFollowupTail, estimateTokens } from './lib/translator.js';
 import { DATA_DIR, getSetting, setSetting } from './lib/store.js';
 import { UA } from './lib/harvest.js';
 import * as auth from './lib/auth.js';
@@ -89,8 +89,18 @@ app.post('/v1/chat/completions', async (req, res) => {
     return res.status(400).json({ error: { message: 'messages array is required', type: 'invalid_request_error' } });
   }
 
-  const query = messagesToQuery(messages);
+  // Conversation strategy: chat.baidu.com guest sessions are single-shot — native
+  // multi-turn is stateful (sessionId + msgId continuation), impractical to replay
+  // in a stateless OpenAI proxy and rate-limited per IP. So we flatten the whole
+  // message array into one role-tagged prompt; the model sees full context and
+  // continues correctly (verified). File upload (BOS) is gated behind a logged-in
+  // account, so >~100k-token contexts can't be offloaded to a file on the guest
+  // path — we send them inline and surface any upstream size error.
+  let query = messagesToQuery(messages);
   const resolved = resolveModel(model);
+  if (resolved.english) query = 'Please respond entirely in English, regardless of the input language.\n\n' + query;
+  const approxTokens = estimateTokens(query);
+  if (approxTokens > 100_000) console.warn(`[completion] large prompt ~${approxTokens} tok — sending inline (no guest file-dump)`);
   const id = newId();
 
   const ac = new AbortController();
