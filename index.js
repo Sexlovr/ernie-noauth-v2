@@ -54,19 +54,21 @@ function authed(req, res) {
 // Drive one completion across the pool. Retries on another IP whenever a slot is
 // walled (kunlun) or errors BEFORE any answer text has been emitted. onDelta is
 // only ever called with real answer text, so once it fires we are committed.
-async function generate({ query, model, signal, onDelta, onReason }) {
+async function generate({ query, model, signal, onDelta, onReason, onAttemptStart, commitOnReason = true }) {
   const tried = new Set();
   let lastErr = 'no egress available';
   for (let attempt = 0; attempt < config.maxRetries; attempt++) {
     const slot = await pool.acquire({ exclude: tried });
     if (!slot) break;
     tried.add(slot.id);
-    let got = false;
+    onAttemptStart?.(); // let buffered (non-stream) callers reset per-attempt state
+    let got = false;        // received answer text
+    let reasoned = false;   // streamed reasoning to the client
     let outcome = 'error';
     try {
       for await (const ev of streamConversation({ session: slot.cookie, query, model, dispatcher: slot.dispatcher, signal })) {
         if (ev.kind === 'delta') { got = true; outcome = 'ok'; onDelta(ev.text); }
-        else if (ev.kind === 'reason') { onReason?.(ev.text); }
+        else if (ev.kind === 'reason') { reasoned = true; onReason?.(ev.text); }
         else if (ev.kind === 'depleted') { outcome = 'depleted'; lastErr = 'all egress IPs rate-limited (kunlun)'; break; }
         else if (ev.kind === 'error') { outcome = 'error'; lastErr = ev.message; break; }
         else if (ev.kind === 'done') { outcome = got ? 'ok' : 'error'; if (!got) lastErr = 'empty response'; }
@@ -78,13 +80,17 @@ async function generate({ query, model, signal, onDelta, onReason }) {
     pool.release(slot, got ? 'ok' : outcome);
     if (got) return { ok: true };
     if (signal?.aborted) return { ok: false, aborted: true };
+    // If we already STREAMED reasoning live (streaming mode), we can't cleanly
+    // re-stream a second <think> on another IP, so stop. Buffered callers
+    // (non-streaming) reset via onAttemptStart and keep retrying healthy IPs.
+    if (commitOnReason && reasoned) return { ok: false, error: lastErr };
   }
   return { ok: false, error: lastErr };
 }
 
 app.post('/v1/chat/completions', async (req, res) => {
   if (!authed(req, res)) return;
-  const { messages, model = 'ernie-noauth', stream = false } = req.body || {};
+  const { messages, model = 'baidu-smart', stream = false } = req.body || {};
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: { message: 'messages array is required', type: 'invalid_request_error' } });
   }
@@ -116,31 +122,39 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders?.();
-      let opened = false;
+      let opened = false, inThink = false, answerStarted = false;
       const filt = makeStreamFilter();
-      const emit = (text) => {
-        if (!text) return;
-        if (!opened) { opened = true; res.write(streamChunk(id, model, { role: 'assistant', content: '' })); }
-        res.write(streamChunk(id, model, { content: text }));
-      };
+      const open = () => { if (!opened) { opened = true; res.write(streamChunk(id, model, { role: 'assistant', content: '' })); } };
+      const write = (text) => { if (text) res.write(streamChunk(id, model, { content: text })); };
       const r = await generate({
         query, model: resolved, signal: ac.signal,
-        onDelta: (text) => emit(filt.push(text)),
+        // reasoning streams first, wrapped in <think>…</think> (matches our other proxies).
+        // Ignore any stray reasoning that arrives after the answer has begun, so we
+        // never reopen a <think> mid-answer.
+        onReason: (text) => { if (answerStarted) return; open(); if (!inThink) { inThink = true; write('<think>\n'); } write(text); },
+        onDelta: (text) => { open(); if (inThink) { inThink = false; write('\n</think>\n\n'); } answerStarted = true; write(filt.push(text)); },
       });
+      if (inThink) write('\n</think>\n\n'); // always close an open think block
       if (r.aborted) return res.end();
-      emit(filt.flush());
-      if (!r.ok && !opened) {
-        res.write(streamChunk(id, model, { role: 'assistant', content: `[proxy error: ${r.error}]` }));
+      write(filt.flush());
+      if (!r.ok) {
+        // surface the failure instead of ending on a silent empty/`<think>`-only turn
+        if (!opened) res.write(streamChunk(id, model, { role: 'assistant', content: `[proxy error: ${r.error}]` }));
+        else write(`\n\n[proxy error: ${r.error}]`);
       }
       res.write(streamChunk(id, model, {}, 'stop'));
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
-      let content = '';
-      const r = await generate({ query, model: resolved, signal: ac.signal, onDelta: (t) => { content += t; } });
+      let content = '', reasoning = '';
+      // buffered, so we can retry across IPs (reset per attempt) without committing
+      const r = await generate({ query, model: resolved, signal: ac.signal, commitOnReason: false,
+        onAttemptStart: () => { content = ''; reasoning = ''; },
+        onReason: (t) => { reasoning += t; }, onDelta: (t) => { content += t; } });
       if (r.aborted) return;
       if (!r.ok) return res.status(502).json({ error: { message: r.error, type: 'upstream_error' } });
-      res.json(fullResponse(id, model, stripFollowupTail(content)));
+      const full = (reasoning ? `<think>\n${reasoning}\n</think>\n\n` : '') + stripFollowupTail(content);
+      res.json(fullResponse(id, model, full));
     }
   } finally {
     finished = true;
